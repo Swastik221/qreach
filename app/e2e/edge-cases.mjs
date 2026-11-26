@@ -140,8 +140,13 @@ try {
 
   // ---------- Form validation ----------
   await s.goto(`${APP}/sponsor/new`);
+  // Wallet drifts to another network; the next transaction must switch back before signing.
+  await s.evaluate(() => { localStorage.setItem("tw-wrong-chain", "1"); window.__twEmit("chainChanged", "0x1"); });
+  await s.locator("header").getByRole("button", { name: /Switch to/ }).waitFor();
   await s.getByRole("button", { name: "Mint 100 test QUSDC" }).click();
   await done(s, "Mint 100 test QUSDC");
+  expect(await s.evaluate(() => localStorage.getItem("tw-wrong-chain")) === null, "wallet was switched before the tx was sent");
+  step("B2 a transaction started on the wrong network switches the wallet first");
   const lockBtn = s.getByRole("button", { name: /^Lock .* QUSDC$/ });
   await s.getByLabel("1. Creator").fill(SPONSOR);
   await s.getByText("You cannot hire yourself.").waitFor();

@@ -1,4 +1,5 @@
 import { BaseError, ContractFunctionRevertedError, UserRejectedRequestError } from "viem";
+import { chain } from "./config";
 
 const MESSAGES: Record<string, string> = {
   ZeroAddress: "An address is missing.",
@@ -35,6 +36,8 @@ export function readableError(e: unknown): string {
       return name || "The transaction was reverted.";
     }
     if (/insufficient funds/i.test(e.message)) return "Not enough QIE in your wallet to pay for gas.";
+    if (/chain mismatch|does not match the target chain|switch chain|unrecognized chain/i.test(e.message))
+      return `Your wallet is on another network. Switch it to ${chain.name} and try again.`;
     return e.shortMessage;
   }
   return e instanceof Error ? e.message : String(e);

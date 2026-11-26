@@ -4,6 +4,56 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {Qreach} from "../src/Qreach.sol";
 import {MockQUSDC, MockRouter, MockQIEID} from "./mocks/Mocks.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+/// Pays with QIE, then tries to re-enter Qreach when the leftover QIE comes back.
+contract ReentrantSponsor {
+    Qreach immutable pp;
+    uint256 public target;
+    bytes public reentryError;
+
+    constructor(Qreach pp_) {
+        pp = pp_;
+    }
+
+    function setTarget(uint256 t) external {
+        target = t;
+    }
+
+    function go(address creator, uint256 amt, uint64 a, uint64 d, uint256 v) external returns (uint256) {
+        return pp.createCampaignWithQIE{value: v}(creator, amt, a, d, 1 hours, "x", block.timestamp + 60);
+    }
+
+    receive() external payable {
+        if (target == 0 || msg.sender != address(pp)) return;
+        uint256 t = target;
+        target = 0;
+        try pp.cancel(t) {}
+        catch (bytes memory e) {
+            reentryError = e;
+        }
+    }
+}
+
+/// A router that calls back into Qreach during the swap.
+contract ReentrantRouter {
+    address public constant WETH = address(0xBEEF);
+    Qreach public pp;
+
+    function setTarget(Qreach pp_) external {
+        pp = pp_;
+    }
+
+    function swapETHForExactTokens(uint256, address[] calldata, address, uint256)
+        external
+        payable
+        returns (uint256[] memory)
+    {
+        pp.refundExpired(1);
+        return new uint256[](2);
+    }
+}
 
 contract QreachTest is Test {
     Qreach pp;
@@ -571,6 +621,169 @@ contract QreachTest is Test {
         assertEq(pp.campaignsOfPost(h, 2, 2).length, 1);
         assertEq(pp.campaignsOfPost(h, 2, 2)[0], 3);
         assertEq(pp.campaignsOfPost(h, 5, 2).length, 0);
+    }
+
+    // ---------------- deadline boundaries ----------------
+
+    function test_accept_atExactDeadlineWorks_andRefundNotYet() public {
+        uint256 id = _create();
+        vm.warp(acceptBy);
+        vm.expectRevert(Qreach.NotExpired.selector);
+        pp.refundExpired(id);
+        vm.prank(creator);
+        pp.accept(id);
+        assertEq(uint8(_status(id)), uint8(Qreach.Status.Accepted));
+    }
+
+    function test_submit_atExactDeadlineWorks_andRefundNotYet() public {
+        uint256 id = _accepted();
+        vm.warp(deliverBy);
+        vm.expectRevert(Qreach.NotExpired.selector);
+        pp.refundExpired(id);
+        vm.prank(creator);
+        pp.submitWork(id, URL);
+        assertEq(uint8(_status(id)), uint8(Qreach.Status.Submitted));
+    }
+
+    // ---------------- funding failures ----------------
+
+    function test_create_revertsInsufficientBalance() public {
+        vm.startPrank(stranger);
+        usdc.approve(address(pp), AMT);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, stranger, 0, AMT));
+        pp.createCampaign(creator, AMT, acceptBy, deliverBy, REVIEW, BRIEF);
+        vm.stopPrank();
+    }
+
+    function test_create_revertsInsufficientAllowance() public {
+        usdc.mint(stranger, AMT);
+        vm.startPrank(stranger);
+        usdc.approve(address(pp), AMT - 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(pp), AMT - 1, AMT)
+        );
+        pp.createCampaign(creator, AMT, acceptBy, deliverBy, REVIEW, BRIEF);
+        vm.stopPrank();
+        assertEq(pp.nextId(), 1);
+    }
+
+    function test_createWithQIE_revertsAfterSwapDeadline() public {
+        vm.deal(sponsor, 1 ether);
+        vm.prank(sponsor);
+        vm.expectRevert(bytes("EXPIRED"));
+        pp.createCampaignWithQIE{value: 1 ether}(creator, AMT, acceptBy, deliverBy, REVIEW, BRIEF, block.timestamp - 1);
+    }
+
+    function test_createWithQIE_validatesAmountBeforeSwap() public {
+        vm.deal(sponsor, 1 ether);
+        vm.prank(sponsor);
+        vm.expectRevert(Qreach.AmountTooSmall.selector);
+        pp.createCampaignWithQIE{value: 1 ether}(creator, 1, acceptBy, deliverBy, REVIEW, BRIEF, block.timestamp + 60);
+    }
+
+    // ---------------- events and stats ----------------
+
+    function test_autoRelease_emitsAndCountsStats() public {
+        uint256 id = _submitted();
+        vm.warp(block.timestamp + REVIEW + 1);
+        vm.expectEmit(true, true, true, true);
+        emit Qreach.PaidPromotion(id, sponsor, creator, AMT, keccak256(bytes(URL)), uint64(block.timestamp), true);
+        pp.autoRelease(id);
+        Qreach.Stats memory s = pp.creatorStats(creator);
+        assertEq(s.completed, 1);
+        assertEq(s.earned, AMT);
+    }
+
+    function test_decline_emitsDeclinedAndRefunded() public {
+        uint256 id = _create();
+        vm.expectEmit(true, true, false, false);
+        emit Qreach.Declined(id, creator);
+        vm.expectEmit(true, true, false, true);
+        emit Qreach.Refunded(id, sponsor, AMT);
+        vm.prank(creator);
+        pp.decline(id);
+    }
+
+    function test_decline_stillAllowedAfterAcceptDeadline() public {
+        uint256 id = _create();
+        vm.warp(acceptBy + 1);
+        vm.prank(creator);
+        pp.decline(id);
+        assertEq(usdc.balanceOf(address(pp)), 0);
+    }
+
+    // ---------------- terminal states and unknown ids ----------------
+
+    function test_terminalStates_cannotMoveFundsAgain() public {
+        uint256 paid = _submitted();
+        vm.prank(sponsor);
+        pp.approveAndPay(paid);
+        vm.prank(sponsor);
+        uint256 declined = pp.createCampaign(creator, AMT, acceptBy, deliverBy, REVIEW, BRIEF);
+        vm.prank(creator);
+        pp.decline(declined);
+        vm.prank(sponsor);
+        uint256 cancelled = pp.createCampaign(creator, AMT, acceptBy, deliverBy, REVIEW, BRIEF);
+        vm.prank(sponsor);
+        pp.cancel(cancelled);
+
+        vm.warp(deliverBy + 30 days);
+        uint256[3] memory ids = [paid, declined, cancelled];
+        for (uint256 i; i < 3; i++) {
+            vm.expectRevert(Qreach.WrongStatus.selector);
+            pp.refundExpired(ids[i]);
+            vm.expectRevert(Qreach.WrongStatus.selector);
+            pp.autoRelease(ids[i]);
+            vm.prank(sponsor);
+            vm.expectRevert(Qreach.WrongStatus.selector);
+            pp.cancel(ids[i]);
+            vm.prank(sponsor);
+            vm.expectRevert(Qreach.WrongStatus.selector);
+            pp.approveAndPay(ids[i]);
+            vm.prank(creator);
+            vm.expectRevert(Qreach.WrongStatus.selector);
+            pp.decline(ids[i]);
+        }
+        assertEq(usdc.balanceOf(address(pp)), 0);
+        assertEq(usdc.balanceOf(creator), AMT);
+    }
+
+    function test_unknownId_reverts() public {
+        vm.expectRevert(Qreach.NotSponsor.selector);
+        pp.approveAndPay(42);
+        vm.expectRevert(Qreach.NotSponsor.selector);
+        pp.cancel(42);
+        vm.expectRevert(Qreach.WrongStatus.selector);
+        pp.autoRelease(42);
+        vm.expectRevert(Qreach.WrongStatus.selector);
+        pp.refundExpired(42);
+    }
+
+    // ---------------- reentrancy ----------------
+
+    /// The leftover-QIE refund hands control to the sponsor; re-entering must fail.
+    function test_reentrancy_viaLeftoverRefundIsBlocked() public {
+        ReentrantSponsor att = new ReentrantSponsor(pp);
+        uint256 cost = AMT * 1e9;
+        vm.deal(address(att), 2 * cost + 1 ether);
+        uint256 first = att.go(creator, AMT, acceptBy, deliverBy, cost); // exact, no callback
+        att.setTarget(first);
+        att.go(creator, AMT, acceptBy, deliverBy, cost + 1 ether);
+        assertEq(att.reentryError(), abi.encodeWithSelector(ReentrancyGuard.ReentrancyGuardReentrantCall.selector));
+        assertEq(uint8(_status(first)), uint8(Qreach.Status.Created));
+        assertEq(usdc.balanceOf(address(pp)), 2 * AMT);
+        assertEq(address(att).balance, 1 ether);
+    }
+
+    /// A router calling back into Qreach during the swap is stopped by the guard.
+    function test_reentrancy_viaRouterIsBlocked() public {
+        ReentrantRouter bad = new ReentrantRouter();
+        Qreach q = new Qreach(address(usdc), address(bad), address(qid));
+        bad.setTarget(q);
+        vm.deal(sponsor, 1 ether);
+        vm.prank(sponsor);
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        q.createCampaignWithQIE{value: 1 ether}(creator, AMT, acceptBy, deliverBy, REVIEW, BRIEF, block.timestamp + 60);
     }
 
     // ---------------- fuzz ----------------

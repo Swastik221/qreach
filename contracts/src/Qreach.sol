@@ -318,7 +318,11 @@ contract Qreach is ReentrancyGuard {
     }
 
     /// @notice Campaign ids for a post, oldest first, `start` to `start + max` (clamped).
-    function campaignsOfPost(bytes32 postHash, uint256 start, uint256 max) external view returns (uint256[] memory ids) {
+    function campaignsOfPost(bytes32 postHash, uint256 start, uint256 max)
+        external
+        view
+        returns (uint256[] memory ids)
+    {
         uint256[] storage all = _campaignsOfPost[postHash];
         if (start >= all.length) return new uint256[](0);
         uint256 end = start + max > all.length ? all.length : start + max;

@@ -99,4 +99,9 @@ contract QreachInvariantTest is Test {
     function invariant_statsMatchPayouts() public view {
         assertEq(pp.creatorStats(h.creator()).earned, usdc.balanceOf(h.creator()));
     }
+
+    /// No QUSDC is created or lost: sponsor + creator + escrow always hold exactly what was minted.
+    function invariant_qusdcConserved() public view {
+        assertEq(usdc.balanceOf(h.sponsor()) + usdc.balanceOf(h.creator()) + usdc.balanceOf(address(pp)), 1e15);
+    }
 }
