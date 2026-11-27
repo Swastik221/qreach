@@ -3,9 +3,12 @@
 Hire creators with escrow, and let anyone check if a post was paid. Built on QIE mainnet for QIE Hackathon 3.0
 (Consumer Apps & Social).
 
-**Status (2026-11-27):** contract and app are complete and tested locally and against a QIE mainnet fork.
-**Not yet deployed to mainnet. No live URL yet.** The deployment section below will hold real addresses and links
-once they exist.
+**Status (2026-11-28):**
+- Tested locally: contract unit, fuzz and invariant tests; app unit tests; browser end-to-end suites on a local chain.
+- Tested against a QIE mainnet fork: real QUSDC, QIEDEX, QIE ID and oracle.
+- Simulated on mainnet: deployment dry run passes its dependency checks.
+- **Not yet deployed to mainnet. No live URL yet. No real two-wallet mainnet flow yet.** The deployment
+  section below will hold real addresses and links once they exist.
 
 ## Problem
 

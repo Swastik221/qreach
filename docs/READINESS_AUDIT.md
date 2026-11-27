@@ -120,7 +120,7 @@ Reviewed manually. Findings:
 | Testnet RPC | `foundry.toml` uses `rpc1testnet`; docs list `rpc4testnet`. Testnet is not used for submission. |
 | Explorer type | Blockscout (`/api/v2/stats` responds), so `forge verify-contract --verifier blockscout` works. |
 | `NEXT_PUBLIC_QREACH`, `NEXT_PUBLIC_DEPLOY_BLOCK` | **Empty: no deployment exists.** |
-| Git remote | `origin` = `github.com/Swastik221/qreach`. The brief names `github.com/Anand-240/qreach`. Needs a decision (P1-4). |
+| Git remote | `origin` = `github.com/Swastik221/qreach` (fork). Submission repo confirmed 2026-11-28: `github.com/Anand-240/qreach`. |
 | `Anchor.toml` | Not present and not relevant (EVM project). |
 | Hosting | No Vercel project, CLI or credentials found on this machine. |
 
@@ -152,3 +152,38 @@ Reviewed manually. Findings:
 ### P3: polish
 1. Investigate why `next dev` breaks the Playwright flow (production build is fine).
 2. Move the e2e suites to `@playwright/test` with an npm script.
+
+## 9. Update 2026-11-28: pre-deployment re-verification
+
+### Repository state
+- PR #1 (`Swastik221/qreach`) was **merged** into the fork's `main` (`e07de10`) on 2026-11-26. It has no reviews or comments.
+- **The official submission repository `Anand-240/qreach` is still at `1942729`.** It has none of the readiness changes. `Swastik221/qreach` is a GitHub fork of it; there is no `upstream` remote locally. The contract to be deployed is `Qreach.sol` @ `e07de10`. That file differs from `1942729` only by `forge fmt` whitespace, but whitespace changes the metadata hash, so the official repo must be updated to match the deployed and verified source.
+
+### Re-run results (all fresh)
+`forge clean && forge build`: compiles, no solc warnings. `forge fmt --check`: ok. `forge test`: 72 unit/fuzz passed (fuzz 512 runs) and 3 invariants passed (64 × 32 calls). The fork suite reports "1 skipped" because its `setUp` calls `vm.skip` unless `FORK=1`. Run with `FORK=1` against mainnet: 4/4 passed. App: `tsc` ok, Vitest 19/19, `next build` ok.
+
+### `forge lint` findings (15) and classification
+
+| Rule | Location | Class | Reasoning |
+|---|---|---|---|
+| reentrancy-eth | `Qreach.sol:186` leftover QIE refund to `msg.sender` before `_create` | Informational / false positive | `createCampaignWithQIE` is `nonReentrant`, as is every other function that moves funds. Re-entry into `accept`, `submitWork` or `setQieName` cannot touch this campaign (no id yet) or any balances. `test_reentrancy_viaLeftoverRefundIsBlocked` proves the guard. |
+| reentrancy-events | `:373` `CampaignCreated` emitted after the swap and refund | Informational | Same guard. The only events that could interleave belong to other campaigns, and the indexer keys everything by id. |
+| unused-return | `:180` router `amounts` ignored | False positive | The contract checks its actual QUSDC balance change instead, which is stronger than trusting the router's return value. |
+| block-timestamp ×6 | `:217, 240, 262, 271, 273, 351` | Low | Deadlines are hours to days long; validator skew is seconds. |
+| unsafe-typecast ×3 | `:249, 378` `uint64(block.timestamp)`; `:368` `uint128(amount)` | False positive | uint64 seconds overflow in ~5.8×10^11 years. `amount > type(uint128).max` reverts in `_validate` before the cast. |
+| uninitialized-local | `:297` `owner_` | False positive | Assigned in the `try` branch; the `catch` branch reverts, so it is never read uninitialized. |
+| require-revert-in-loop | `:401` URL character check | Informational | Intended: reject on the first bad byte. |
+| environment-read-across-mutation | `test/Qreach.t.sol:688` | Informational (test only) | Without via-IR, `block.timestamp` reads the warped value; the test passes and asserts the right timestamp. |
+
+Also noted, no change needed: (a) QIE force-sent to the contract (selfdestruct) is never refunded and stays stuck, harming no one; (b) if a router ever returned more than `amountOut`, the extra QUSDC would sit unaccounted in the contract. QIEDEX `swapETHForExactTokens` returns exactly `amountOut`, and the mainnet fork test confirms it.
+
+**Conclusion:** no Critical/High/Medium findings. No Solidity change.
+
+### Mainnet dependencies (read-only, block ~12,216,054)
+Chain id 1990. All four dependencies and the oracle have bytecode, and none is an EIP-1967 proxy. QUSDC: `symbol` QUSDC, `decimals` 6. Router: `WETH()` = `0x0087…9139` (symbol WQIE); factory `0x8E23…398C`. Quote: 1 QUSDC = 6.33 QIE. QIE ID: `domainOwnerByName("qie","qie")` returns an owner; unknown names revert ("ERC721: owner query for nonexistent token"), which the contract turns into `NotNameOwner`. Still **undocumented by QIE: the QIE ID registry address** (S4).
+
+### Deployer and simulation
+- Keystore `deployer` present. Address `0x17be41a4b30AF4C31a6D763139425af1adee1B45` (from the owner's own `--account deployer` simulation; Foundry keystores store no plaintext address). The keystore file mode was `0644`; set to `600` on 2026-11-28.
+- Balance 0.05 QIE, nonce 0. Simulation from this sender: `preflight ok`, 1 CREATE, value 0, predicted `0xecf00C31f73296A1EFa9Fe4D3514813D93807740` (matches the earlier simulation, as expected for nonce 0). Gas limit 2,935,961; forge estimate 0.00587 QIE.
+- The deploy calldata equals the compiled `Qreach` creation code plus constructor args, byte for byte.
+- `foundry-pp/DeployHelper51.sol` stale-artifact warning: a temporary file of forge's `dynamic_test_linking` preprocessor. No `out/` artifact or cache entry references it, and it has no effect on the deployed bytecode (calldata check above).
